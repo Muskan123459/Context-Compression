@@ -9,7 +9,7 @@ import os
 
 VLLM_BASE_URL: str = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
 MODEL: str = os.getenv("MODEL", "HuggingFaceTB/SmolLM3-3B")
-MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "512"))
+MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "768"))
 MAX_TOOL_ROUNDS: int = int(os.getenv("MAX_TOOL_ROUNDS", "5"))
 
 # Model's hard context-window cap — anything past this is "overflow"

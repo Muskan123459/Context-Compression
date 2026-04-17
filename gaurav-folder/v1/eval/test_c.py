@@ -239,16 +239,19 @@ def run_conversation(
     for turn_no, user_msg in SCRIPT:
         t0 = time.monotonic()
 
+        augmented_msg = user_msg   # will be overwritten with tool-blob version if tools fire
+
         if dry_run:
             reply_text  = _DRY_RUN_RESPONSES.get(turn_no, "(no canned response)")
             token_count = 0
             trace: list[str] = []
         else:
             try:
-                agent_reply = run_agent(user_msg, history, verbose=False)
-                reply_text  = agent_reply.text
-                token_count = agent_reply.usage.total
-                trace       = agent_reply.trace
+                agent_reply   = run_agent(user_msg, history, verbose=False)
+                reply_text    = agent_reply.text
+                token_count   = agent_reply.usage.total
+                trace         = agent_reply.trace
+                augmented_msg = agent_reply.augmented_message or user_msg
             except Exception as exc:
                 overflow_msg = (
                     f"[CONTEXT OVERFLOW at Turn {turn_no}] {type(exc).__name__}: {exc}"
@@ -275,7 +278,8 @@ def run_conversation(
         result.peak_tokens    = max(result.peak_tokens, token_count)
         result.final_response = reply_text
 
-        history.append({"role": "user",      "content": user_msg})
+        # Store the augmented message (with tool blobs) so tool data accumulates in context
+        history.append({"role": "user",      "content": augmented_msg})
         history.append({"role": "assistant", "content": reply_text})
 
         print(f"Turn {turn_no}  {_token_bar_str(token_count)}  {latency:.1f}s", flush=True)

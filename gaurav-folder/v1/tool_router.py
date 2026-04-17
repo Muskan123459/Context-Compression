@@ -86,13 +86,34 @@ class ToolCall(NamedTuple):
 # ---------------------------------------------------------------------------
 # Main router
 # ---------------------------------------------------------------------------
+# Phrases that signal "I'm confirming a booking / asking to track spend"
+# — no new search needed, skip all tool calls.
+_BOOKING_RE = re.compile(
+    r"let'?s assume|assume i book|assume that|let'?s say i"
+    r"|please track|track that|add that|add both|add to"
+    r"|book that|looks good|that works|looks solid"
+    r"|i'?ve booked|i'?ve sorted|i'?ve confirmed"
+    r"|booked at|confirm that|remind me",
+    re.IGNORECASE,
+)
+
+
+def _is_booking_confirmation(message: str) -> bool:
+    """True when the user is confirming a price / asking to track spend — not searching."""
+    return bool(_BOOKING_RE.search(message))
+
+
 def route_and_call(user_message: str) -> list[ToolCall]:
     """
     Inspect *user_message* with keyword rules and immediately execute
     whatever tools are relevant.  Returns a list of ToolCall results.
 
+    Booking-confirmation turns are skipped — they contain no search intent.
     Called BEFORE the LLM, so results can be injected as context.
     """
+    if _is_booking_confirmation(user_message):
+        return []
+
     msg = user_message.lower()
     calls: list[ToolCall] = []
 

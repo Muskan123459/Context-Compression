@@ -50,10 +50,11 @@ class TokenUsage:
 
 @dataclass
 class AgentReply:
-    text:       str
-    usage:      TokenUsage
-    trace:      list[str]       = field(default_factory=list)
-    tool_calls: list[ToolCall]  = field(default_factory=list)  # tools pre-called this turn
+    text:              str
+    usage:             TokenUsage
+    trace:             list[str]       = field(default_factory=list)
+    tool_calls:        list[ToolCall]  = field(default_factory=list)
+    augmented_message: str             = ""   # user msg + injected tool blobs (store in history)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +166,7 @@ def run_agent(
         usage=usage,
         trace=trace,
         tool_calls=pre_calls,
+        augmented_message=augmented_message,
     )
 
 

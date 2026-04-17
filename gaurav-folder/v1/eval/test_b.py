@@ -333,16 +333,19 @@ def run_conversation(
     for turn_no, user_msg in SCRIPT:
         t0 = time.monotonic()
 
+        augmented_msg = user_msg
+
         if dry_run:
             reply_text  = _DRY_RUN_RESPONSES.get(turn_no, "(no canned response)")
             token_count = 0
             trace: list[str] = []
         else:
             try:
-                agent_reply = run_agent(user_msg, history, verbose=False)
-                reply_text  = agent_reply.text
-                token_count = agent_reply.usage.total
-                trace       = agent_reply.trace
+                agent_reply   = run_agent(user_msg, history, verbose=False)
+                reply_text    = agent_reply.text
+                token_count   = agent_reply.usage.total
+                trace         = agent_reply.trace
+                augmented_msg = agent_reply.augmented_message or user_msg
             except Exception as exc:
                 overflow_msg = (
                     f"[CONTEXT OVERFLOW at Turn {turn_no}] {type(exc).__name__}: {exc}"
@@ -374,7 +377,7 @@ def run_conversation(
         result.turns.append(tr)
         result.peak_tokens = max(result.peak_tokens, token_count)
 
-        history.append({"role": "user",      "content": user_msg})
+        history.append({"role": "user",      "content": augmented_msg})
         history.append({"role": "assistant", "content": reply_text})
 
         token_bar = _token_bar_str(token_count)
