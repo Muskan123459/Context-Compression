@@ -103,6 +103,32 @@ def _is_booking_confirmation(message: str) -> bool:
     return bool(_BOOKING_RE.search(message))
 
 
+def is_booking_confirmation(message: str) -> bool:
+    """Public alias for GlobalState extraction and other callers."""
+    return _is_booking_confirmation(message)
+
+
+def extract_all_cities(message: str) -> list[str]:
+    """
+    Return recognised cities in *message* in order of first appearance,
+    deduped by canonical display name (e.g. Ubud/Seminyak → Bali once).
+    """
+    msg = message.lower()
+    hits: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for city in _CITIES:
+        pos = msg.find(city)
+        if pos < 0:
+            continue
+        disp = _CITY_DISPLAY.get(city, city.title())
+        if disp in seen:
+            continue
+        seen.add(disp)
+        hits.append((pos, disp))
+    hits.sort(key=lambda h: h[0])
+    return [h[1] for h in hits]
+
+
 def route_and_call(user_message: str) -> list[ToolCall]:
     """
     Inspect *user_message* with keyword rules and immediately execute
@@ -120,6 +146,7 @@ def route_and_call(user_message: str) -> list[ToolCall]:
     # ── web_search — flights / general travel info ────────────────────────
     if _has_word(msg,
         "flight", "fly", "airline", "route", "ticket",
+        "itinerary", "plan", "trip",
     ) or "multi-city" in msg or "travel from" in msg or "book flight" in msg:
         query = f"flights {user_message[:120]}"
         result = dispatch_tool("web_search", {"query": query})

@@ -299,10 +299,11 @@ class TurnResult:
 
 @dataclass
 class RunResult:
-    turns:          list[TurnResult] = field(default_factory=list)
-    peak_tokens:    int = 0
-    final_response: str = ""
-    overflow_turn:  Optional[int] = None   # set when context limit is hit mid-run
+    turns:                    list[TurnResult] = field(default_factory=list)
+    peak_tokens:              int = 0
+    peak_state_prompt_tokens: int = 0  # v2: pinned GlobalState block (tiktoken / heuristic)
+    final_response:           str = ""
+    overflow_turn:            Optional[int] = None   # set when context limit is hit mid-run
 
 
 def _print_trace(trace: list[str]) -> None:
@@ -329,6 +330,11 @@ def run_conversation(
 
     if not dry_run:
         from agent import run_agent  # noqa: PLC0415
+        from global_state import GlobalState  # noqa: PLC0415
+
+        conv_state = GlobalState()
+    else:
+        conv_state = None  # unused
 
     for turn_no, user_msg in SCRIPT:
         t0 = time.monotonic()
@@ -341,11 +347,17 @@ def run_conversation(
             trace: list[str] = []
         else:
             try:
-                agent_reply   = run_agent(user_msg, history, verbose=False)
+                agent_reply   = run_agent(
+                    user_msg, history, state=conv_state, verbose=False
+                )
                 reply_text    = agent_reply.text
                 token_count   = agent_reply.usage.total
                 trace         = agent_reply.trace
                 augmented_msg = agent_reply.augmented_message or user_msg
+                result.peak_state_prompt_tokens = max(
+                    result.peak_state_prompt_tokens,
+                    agent_reply.pinned_block_tokens,
+                )
             except Exception as exc:
                 overflow_msg = (
                     f"[CONTEXT OVERFLOW at Turn {turn_no}] {type(exc).__name__}: {exc}"
@@ -443,6 +455,11 @@ def evaluate(result: RunResult) -> list[Assertion]:
             passed=False,
             detail="N/A — agent crashed before Turn 20; could not evaluate budget recall.",
         ))
+        assertions.append(Assertion(
+            name="A4 · pinned GlobalState ≤300 tokens",
+            passed=False,
+            detail="N/A — context overflow before completion",
+        ))
         return assertions
 
     # ── A2: Budget awareness in Turn-20 response ────────────────────────────
@@ -468,6 +485,17 @@ def evaluate(result: RunResult) -> list[Assertion]:
             if not blind_luxury else
             "FAIL — agent recommended Four Seasons / Katamama without flagging "
             f"that only ~${EXPECTED_LEFT:.0f} remains.  Baseline lost budget state."
+        ),
+    ))
+
+    cap_ok = result.peak_state_prompt_tokens <= 300
+    assertions.append(Assertion(
+        name="A4 · pinned GlobalState ≤300 tokens",
+        passed=cap_ok,
+        detail=(
+            f"peak pinned block={result.peak_state_prompt_tokens:,} tok (cap 300)"
+            if cap_ok else
+            f"OVER CAP: {result.peak_state_prompt_tokens:,} tok"
         ),
     ))
 
@@ -525,6 +553,10 @@ def print_report(result: RunResult, assertions: list[Assertion], *, dry_run: boo
     print(f"  Spent        : ${EXPECTED_SPENT:,.0f}  "
           f"(flights $1,850 + Paris $550 + Amsterdam $320 + Tokyo $700)")
     print(f"  Remaining    : ${EXPECTED_LEFT:,.0f}  ← agent MUST acknowledge this")
+    print()
+    print("  Pinned GlobalState block (v2)")
+    print("  ─" * 34)
+    print(f"  peak tokens : {result.peak_state_prompt_tokens:,}  (target cap ≤ 300)")
 
     # Assertions
     print()
@@ -548,8 +580,8 @@ def print_report(result: RunResult, assertions: list[Assertion], *, dry_run: boo
         verdict = _colour("OVERALL: FAIL", RED + BOLD)
         if not dry_run:
             note = (
-                "This is the EXPECTED outcome for the v1 baseline — "
-                "no compression means the agent loses cumulative budget state."
+                "FAIL on live run with v2 GlobalState: check extraction, pinned prompt, "
+                "or model behavior. (Legacy v1 baseline often failed this test.)"
             )
             print(f"  {_colour(note, YELLOW)}")
         else:
@@ -573,6 +605,7 @@ def _save_log(result: RunResult, assertions: list[Assertion], path: Path) -> Non
             "expected_remaining": EXPECTED_LEFT,
         },
         "peak_tokens": result.peak_tokens,
+        "peak_state_prompt_tokens": result.peak_state_prompt_tokens,
         "turns": [
             {
                 "turn": tr.turn,

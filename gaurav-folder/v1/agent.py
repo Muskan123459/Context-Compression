@@ -1,33 +1,26 @@
 """
-v1 — Bloat and Break agent.
+v2 — Bloat-and-Break agent + L1 sticky GlobalState.
 
-Drop-in replacement for v0/agent.py.  Key additions over v0:
-  • Uses all 4 tools (web_search, places_search, weather_fetch, budget_tracker)
-    with 2 000-3 000 token bloated fixtures — context grows fast.
-  • Prints a token counter after every turn so you can watch it climb.
-  • Returns `TokenUsage` alongside the reply so eval scripts can assert on it.
-
-No compression.  Full history stuffed every turn.  This is the baseline.
+Same bloated tools and full history as v1, plus a bounded GlobalState block
+pinned into the system prompt each turn (regex + optional LLM extraction).
 """
 from __future__ import annotations
 
 import json
 import re
-import sys
 from dataclasses import dataclass, field
-from typing import Optional
-
 from openai import OpenAI
 
 from config import (
     CONTEXT_LIMIT,
     MAX_TOKENS,
-    MAX_TOOL_ROUNDS,
     MODEL,
     SYSTEM_PROMPT,
     VLLM_BASE_URL,
     WARN_THRESHOLD,
 )
+from global_state import GlobalState, count_text_tokens
+from state_extractor import maybe_llm_extract, merge_regex
 from tool_router import ToolCall, format_context_block, route_and_call
 
 # ---------------------------------------------------------------------------
@@ -50,22 +43,46 @@ class TokenUsage:
 
 @dataclass
 class AgentReply:
-    text:              str
-    usage:             TokenUsage
-    trace:             list[str]       = field(default_factory=list)
-    tool_calls:        list[ToolCall]  = field(default_factory=list)
-    augmented_message: str             = ""   # user msg + injected tool blobs (store in history)
+    text:                 str
+    usage:                TokenUsage
+    trace:                list[str]       = field(default_factory=list)
+    tool_calls:           list[ToolCall]  = field(default_factory=list)
+    augmented_message:    str             = ""   # user msg + injected tool blobs (store in history)
+    state:                GlobalState     = field(default_factory=GlobalState)
+    pinned_block_tokens:  int             = 0
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _strip_think(text: str) -> tuple[str, str]:
-    """Split `<think>…</think>` blocks from the visible reply."""
-    think_match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
-    think_text = think_match.group(1).strip() if think_match else ""
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    return clean, think_text
+    """Split `<think>…</think>` blocks from the visible reply.
+
+    Handles a truncated think block (opening `<think>` with no closer — happens
+    when the model runs out of `max_tokens` mid-reasoning) by treating
+    everything from the opening tag onward as hidden thought.
+    """
+    think_parts: list[str] = []
+
+    def _capture(match: re.Match) -> str:
+        think_parts.append(match.group(1).strip())
+        return ""
+
+    clean = re.sub(r"<think>(.*?)</think>", _capture, text, flags=re.DOTALL)
+
+    open_idx = clean.find("<think>")
+    if open_idx != -1:
+        think_parts.append(clean[open_idx + len("<think>"):].strip())
+        clean = clean[:open_idx]
+
+    clean = clean.strip()
+    if not clean and think_parts:
+        clean = (
+            "_(model ran out of tokens while thinking — raise `MAX_TOKENS` "
+            "or keep `/no_think` in the system prompt)_"
+        )
+
+    return clean, "\n".join(p for p in think_parts if p)
 
 
 def _token_bar(usage: TokenUsage) -> str:
@@ -85,6 +102,7 @@ def run_agent(
     user_message: str,
     history: list[dict],
     *,
+    state: GlobalState | None = None,
     verbose: bool = True,
 ) -> AgentReply:
     """
@@ -103,10 +121,15 @@ def run_agent(
 
     Returns
     -------
-    AgentReply with .text, .usage, .trace, .tool_calls
+    AgentReply with .text, .usage, .trace, .tool_calls, .state, .pinned_block_tokens
     """
     trace: list[str] = []
     usage = TokenUsage()
+    gs = state if state is not None else GlobalState()
+
+    gs.turn_count += 1
+    merge_regex(gs, user_message)
+    maybe_llm_extract(gs, user_message, client, trace)
 
     # ── Step 1: Rule-based tool routing ──────────────────────────────────
     pre_calls = route_and_call(user_message)
@@ -128,7 +151,10 @@ def run_agent(
         augmented_message = f"{context_block}\n\nUser query: {user_message}"
 
     # ── Step 3: Build message list and call LLM ───────────────────────────
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    pinned = gs.to_prompt_block()
+    pinned_tokens = count_text_tokens(pinned) if pinned else 0
+    system_content = SYSTEM_PROMPT + (f"\n\n{pinned}" if pinned else "")
+    messages: list[dict] = [{"role": "system", "content": system_content}]
     messages.extend(history)
     messages.append({"role": "user", "content": augmented_message})
 
@@ -167,17 +193,23 @@ def run_agent(
         trace=trace,
         tool_calls=pre_calls,
         augmented_message=augmented_message,
+        state=gs,
+        pinned_block_tokens=pinned_tokens,
     )
 
 
 # ---------------------------------------------------------------------------
 # Gradio UI entry-point  (UI lives in ui.py — imported from there)
 # ---------------------------------------------------------------------------
-def chat_fn(message: str, history: list[dict]) -> tuple[str, str]:
-    """Adapter for gr.ChatInterface."""
-    reply = run_agent(message, history, verbose=False)
-    trace_lines = reply.trace
-    return reply.text, "\n".join(trace_lines)
+def chat_fn(
+    message: str,
+    history: list[dict],
+    state: GlobalState | None = None,
+) -> tuple[str, str, GlobalState]:
+    """Adapter for gr.ChatInterface (optional external GlobalState)."""
+    gs = state if state is not None else GlobalState()
+    reply = run_agent(message, history, state=gs, verbose=False)
+    return reply.text, "\n".join(reply.trace), gs
 
 
 if __name__ == "__main__":

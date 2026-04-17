@@ -235,6 +235,11 @@ def run_conversation(
 
     if not dry_run:
         from agent import run_agent  # noqa: PLC0415
+        from global_state import GlobalState  # noqa: PLC0415
+
+        conv_state = GlobalState()
+    else:
+        conv_state = None  # unused
 
     for turn_no, user_msg in SCRIPT:
         t0 = time.monotonic()
@@ -247,7 +252,9 @@ def run_conversation(
             trace: list[str] = []
         else:
             try:
-                agent_reply   = run_agent(user_msg, history, verbose=False)
+                agent_reply   = run_agent(
+                    user_msg, history, state=conv_state, verbose=False
+                )
                 reply_text    = agent_reply.text
                 token_count   = agent_reply.usage.total
                 trace         = agent_reply.trace
