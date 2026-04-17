@@ -143,26 +143,55 @@ def route_and_call(user_message: str) -> list[ToolCall]:
     msg = user_message.lower()
     calls: list[ToolCall] = []
 
+    cities_in_msg = extract_all_cities(user_message)
+    # For place-scoped tools (hotels / food / attractions / weather) we need a
+    # single primary city.  For web_search queries we want every city mentioned.
+    primary_city = cities_in_msg[0] if cities_in_msg else _extract_city(user_message)
+
+    planning_signal = (
+        _has_word(msg,
+            "flight", "fly", "airline", "route", "ticket",
+            "itinerary", "plan", "trip", "suggest", "recommend",
+            "advice", "options", "budget",
+        )
+        or "multi-city" in msg
+        or "travel from" in msg
+        or "book flight" in msg
+        or "what do you" in msg
+        or "day by day" in msg
+        or len(cities_in_msg) >= 2   # 2+ cities almost always means "plan the trip"
+    )
+
     # ── web_search — flights / general travel info ────────────────────────
-    if _has_word(msg,
-        "flight", "fly", "airline", "route", "ticket",
-        "itinerary", "plan", "trip",
-    ) or "multi-city" in msg or "travel from" in msg or "book flight" in msg:
-        query = f"flights {user_message[:120]}"
+    if planning_signal:
+        # Build a city-aware query so the fixture matcher actually hits a route
+        # instead of silently falling back to "delhi to paris".
+        if cities_in_msg:
+            route_hint = " to ".join(c.lower() for c in cities_in_msg[:3])
+            query = f"flights delhi to {route_hint}"[:140]
+        else:
+            query = f"flights {user_message[:120]}"
         result = dispatch_tool("web_search", {"query": query})
         calls.append(ToolCall("web_search", {"query": query}, result))
 
     # ── places_search — hotels / restaurants / attractions ────────────────
-    city = _extract_city(user_message)
+    city = primary_city
     if city:
-        # Hotels
-        if _has_word(msg,
+        hotel_keywords = _has_word(msg,
             "hotel", "stay", "accommodation", "hostel", "resort",
             "villa", "inn", "lodge", "room",
-        ) or "place to stay" in msg or "where to sleep" in msg:
+        ) or "place to stay" in msg or "where to sleep" in msg
+
+        # If the user is planning with cities+budget but didn't literally say
+        # "hotel", we still want hotel fixtures for every mentioned city.
+        implicit_hotel_ask = planning_signal and not _is_booking_confirmation(user_message)
+
+        if hotel_keywords or implicit_hotel_ask:
             cat = "hotels"
-            result = dispatch_tool("places_search", {"city": city, "category": cat})
-            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+            cities_to_query = cities_in_msg or [city]
+            for c in cities_to_query[:3]:
+                result = dispatch_tool("places_search", {"city": c, "category": cat})
+                calls.append(ToolCall("places_search", {"city": c, "category": cat}, result))
 
         # Restaurants / food
         if _has_word(msg,
