@@ -1,0 +1,174 @@
+"""
+v1 — Rule-based tool router.
+
+Sits between the user message and the LLM call.
+Decides which tools to pre-call, executes them, and returns a formatted
+context block that gets injected into the conversation before the LLM
+generates its reply.
+
+This approach is reliable with any model regardless of its function-calling
+capability: the LLM only needs to read the injected results and write a
+text reply — no tool_call JSON required from the model.
+
+The routing rules are intentionally simple keyword matches, as recommended
+by the problem statement: "make the tool definitions rule based (if you want),
+but the tools should return valid outputs."
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import NamedTuple
+
+from tools import dispatch_tool
+
+
+def _has_word(text: str, *words: str) -> bool:
+    """True if any of *words* appears as a word-start match in *text* (handles plurals/gerunds)."""
+    for w in words:
+        if re.search(r"\b" + re.escape(w), text, re.IGNORECASE):
+            return True
+    return False
+
+# ---------------------------------------------------------------------------
+# Known cities (all lower-case for matching)
+# ---------------------------------------------------------------------------
+_CITIES: list[str] = [
+    "paris", "amsterdam", "tokyo", "bali", "delhi",
+    "berlin", "london", "new york", "dubai", "singapore",
+    "rome", "florence", "kyoto", "osaka", "ubud", "seminyak",
+    "dehradun", "manali", "shimla",
+]
+
+# Canonical display names (title-cased)
+_CITY_DISPLAY: dict[str, str] = {
+    "ubud": "Bali",      # fixture is indexed by "bali"
+    "seminyak": "Bali",
+}
+
+
+def _extract_city(message: str) -> str | None:
+    """Return the first recognised city in *message*, or None."""
+    msg = message.lower()
+    for city in _CITIES:
+        if city in msg:
+            return _CITY_DISPLAY.get(city, city.title())
+    return None
+
+
+def _extract_amount(message: str) -> float | None:
+    """Return the first dollar amount mentioned, e.g. '$1,850' → 1850.0."""
+    m = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", message)
+    if m:
+        return float(m.group(1).replace(",", ""))
+    return None
+
+
+def _extract_category(message: str) -> str:
+    msg = message.lower()
+    if any(w in msg for w in ["restaurant", "eat", "food", "ramen", "cuisine", "dinner", "lunch", "cafe"]):
+        return "restaurants"
+    if any(w in msg for w in ["attraction", "visit", "see", "sightseeing", "things to do",
+                               "temple", "museum", "park", "observation", "deck"]):
+        return "attractions"
+    return "hotels"  # default
+
+
+# ---------------------------------------------------------------------------
+# Routing result
+# ---------------------------------------------------------------------------
+class ToolCall(NamedTuple):
+    name:   str
+    args:   dict
+    result: str   # JSON string returned by the tool
+
+
+# ---------------------------------------------------------------------------
+# Main router
+# ---------------------------------------------------------------------------
+def route_and_call(user_message: str) -> list[ToolCall]:
+    """
+    Inspect *user_message* with keyword rules and immediately execute
+    whatever tools are relevant.  Returns a list of ToolCall results.
+
+    Called BEFORE the LLM, so results can be injected as context.
+    """
+    msg = user_message.lower()
+    calls: list[ToolCall] = []
+
+    # ── web_search — flights / general travel info ────────────────────────
+    if _has_word(msg,
+        "flight", "fly", "airline", "route", "ticket",
+    ) or "multi-city" in msg or "travel from" in msg or "book flight" in msg:
+        query = f"flights {user_message[:120]}"
+        result = dispatch_tool("web_search", {"query": query})
+        calls.append(ToolCall("web_search", {"query": query}, result))
+
+    # ── places_search — hotels / restaurants / attractions ────────────────
+    city = _extract_city(user_message)
+    if city:
+        # Hotels
+        if _has_word(msg,
+            "hotel", "stay", "accommodation", "hostel", "resort",
+            "villa", "inn", "lodge", "room",
+        ) or "place to stay" in msg or "where to sleep" in msg:
+            cat = "hotels"
+            result = dispatch_tool("places_search", {"city": city, "category": cat})
+            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+
+        # Restaurants / food
+        if _has_word(msg,
+            "restaurant", "food", "ramen", "cuisine",
+            "dinner", "lunch", "breakfast", "cafe", "dining",
+        ) or "things to eat" in msg:
+            cat = "restaurants"
+            result = dispatch_tool("places_search", {"city": city, "category": cat})
+            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+
+        # Attractions
+        if _has_word(msg,
+            "attraction", "sightseeing", "temple", "museum", "landmark",
+        ) or "things to do" in msg or "observation deck" in msg:
+            cat = "attractions"
+            result = dispatch_tool("places_search", {"city": city, "category": cat})
+            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+
+        # Weather
+        if _has_word(msg,
+            "weather", "temperature", "climate", "rain", "forecast",
+        ) or "what to wear" in msg or "what to pack" in msg:
+            result = dispatch_tool("weather_fetch", {"city": city})
+            calls.append(ToolCall("weather_fetch", {"city": city}, result))
+
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# Context-block formatter
+# ---------------------------------------------------------------------------
+def format_context_block(calls: list[ToolCall]) -> str:
+    """
+    Render tool results as a human-readable context block to be injected
+    into the conversation before the LLM reply.
+
+    The block is prefixed and suffixed with clear markers so that —
+    when we later build compression — it can be detected and summarised.
+    """
+    if not calls:
+        return ""
+
+    lines: list[str] = [
+        "────────────────────────────────────────────────────",
+        "TOOL RESULTS (fetched automatically — use these to answer):",
+    ]
+    for tc in calls:
+        lines.append(f"\n[{tc.name}({json.dumps(tc.args, ensure_ascii=False)})]")
+        # Pretty-print the JSON result
+        try:
+            parsed = json.loads(tc.result)
+            lines.append(json.dumps(parsed, indent=2, ensure_ascii=False))
+        except Exception:
+            lines.append(tc.result)
+    lines.append("\n────────────────────────────────────────────────────")
+
+    return "\n".join(lines)
