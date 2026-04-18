@@ -13,7 +13,7 @@ Key design decisions
 - Parsing is fault-tolerant: accepts both "Field: value" and prose forms.
 
 Public interface:
-    Summarizer(model, tokenizer, debug=False, max_summary_tokens=48)
+    Summarizer(model, tokenizer, debug=False)
     summarizer.update(history) -> SummaryBlock
     summarizer.inject(system_prompt, block) -> str
 """
@@ -101,18 +101,10 @@ _SYSTEM = textwrap.dedent("""\
 # ---------------------------------------------------------------------------
 
 class Summarizer:
-    def __init__(
-        self,
-        model,
-        tokenizer,
-        debug: bool = False,
-        max_summary_tokens: int = 48,
-    ):
+    def __init__(self, model, tokenizer, debug: bool = False):
         self.model     = model
         self.tokenizer = tokenizer
         self.debug     = debug
-        # Short structured lines only — smaller decode budget is much faster on CPU.
-        self.max_summary_tokens = max(16, min(int(max_summary_tokens), 256))
         self._current  = SummaryBlock()
 
     # ------------------------------------------------------------------
@@ -172,8 +164,7 @@ class Summarizer:
         lines = []
         for m in turns:
             role    = "User" if m["role"] == "user" else "Assistant"
-            cap     = 280 if m["role"] == "user" else 220
-            content = m["content"][:cap]
+            content = m["content"][:400]   # cap long responses
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
@@ -189,12 +180,11 @@ class Summarizer:
         in_len  = inputs["input_ids"].shape[-1]
 
         import torch
-        with torch.inference_mode():
+        with torch.no_grad():
             out_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_summary_tokens,
+                max_new_tokens=150,
                 do_sample=False,
-                use_cache=True,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         new_ids = out_ids[0][in_len:]

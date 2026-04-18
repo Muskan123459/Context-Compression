@@ -17,110 +17,13 @@ import argparse
 import json
 import re
 import time
-from typing import Any, Callable
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ccm.summarizer import Summarizer, SummaryBlock
-from tools import budget_tracker as budget_tool_mod
-from tools import places_search as places_tool_mod
-from tools import weather_fetch as weather_tool_mod
-from tools import web_search as web_tool_mod
-from tools.registry import SCHEMAS
-
-
-# ---------------------------------------------------------------------------
-# Tool execution (matches current tool modules; avoids registry .run mismatch)
-# ---------------------------------------------------------------------------
-
-_TOOL_DISPATCH: dict[str, Callable[..., Any]] = {
-    "web_search":     lambda a: web_tool_mod.web_search(**a),
-    "places_search":  lambda a: places_tool_mod.places_search(**a),
-    "weather_fetch":  lambda a: weather_tool_mod.weather_fetch(**a),
-    "budget_tracker": lambda a: budget_tool_mod.budget_tracker(**a),
-}
-
-
-def _unwrap_schema(schema: dict) -> dict:
-    if schema.get("type") == "function" and "function" in schema:
-        return schema["function"]
-    return schema
-
-
-def build_tool_schema_block() -> str:
-    """Same content as registry.tool_schema_block, but supports nested SCHEMA format."""
-    lines = [
-        "## Your intelligence comes first",
-        "",
-        "Answer from your own knowledge whenever possible.",
-        "Before considering a tool, ask yourself:",
-        "  'Do I already know enough to give a good answer?'",
-        "",
-        "Answer DIRECTLY (no tool) for:",
-        "  - General travel advice, tips, culture, etiquette",
-        "  - Geography, history, language, cuisine overviews",
-        "  - Packing lists, visa process explanations, safety tips",
-        "  - Planning logic, itinerary structure, scheduling advice",
-        "  - Budget math when numbers are already in the conversation",
-        "  - Any factual question you can answer confidently",
-        "",
-        "Use a tool ONLY when you need data you genuinely cannot know:",
-        "  - weather_fetch  → today's live weather in a specific city",
-        "  - places_search  → actual hotel/restaurant/attraction listings",
-        "  - web_search     → current flight prices, breaking travel news",
-        "  - budget_tracker → recording or retrieving tracked spend numbers",
-        "",
-        "## Decision rule",
-        "  CAN I answer this well from my own knowledge? → Answer directly.",
-        "  Do I need a live number, listing, or tracked state?  → Use ONE tool.",
-        "",
-        "## Tool call format  (use EXACTLY this, nothing else on those lines)",
-        "",
-        "<tool_call>",
-        '{"name": "<tool_name>", "arguments": {<json key-value pairs>}}',
-        "</tool_call>",
-        "",
-        "## After receiving a TOOL_RESULT",
-        "  - Synthesise it — do NOT just echo the raw data.",
-        "  - Layer in your own expertise: tips, warnings, context, recommendations.",
-        "  - Surface any warnings (over budget, shellfish, scheduling conflicts) first.",
-        "  - Always end with a clear recommendation or next step.",
-        "",
-        "## Tool definitions",
-    ]
-    for schema in SCHEMAS:
-        meta = _unwrap_schema(schema)
-        name = meta["name"]
-        desc = meta.get("description", "")
-        lines.append(f"\n### {name}")
-        lines.append(f"Description: {desc}")
-        lines.append("Parameters:")
-        params = meta.get("parameters") or {}
-        props = params.get("properties") or {}
-        required = set(params.get("required") or [])
-        if not props:
-            lines.append("  (none)")
-            continue
-        for pname, pschema in props.items():
-            pdesc = pschema.get("description", "")
-            req = "required" if pname in required else "optional"
-            lines.append(f"  - {pname} ({req}): {pdesc}")
-    return "\n".join(lines)
-
-
-def execute_tool(name: str, arguments: dict) -> str:
-    """Run a tool and return JSON (same contract as tools.registry.execute)."""
-    fn = _TOOL_DISPATCH.get(name)
-    if fn is None:
-        return json.dumps({"error": f"Unknown tool: '{name}'"})
-    try:
-        result = fn(arguments)
-        return json.dumps(result, indent=2)
-    except TypeError as exc:
-        return json.dumps({"error": f"Bad arguments for '{name}': {exc}"})
-    except Exception as exc:
-        return json.dumps({"error": f"Tool '{name}' raised: {exc}"})
+from tools import budget_tracker
+from tools.registry import execute, tool_schema_block
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +56,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "Be concise, practical, and opinionated — give recommendations, not just lists.\n\n"
     "IMPORTANT RULES:\n"
     "1. If the user mentions a budget amount, immediately call budget_tracker with "
-    "action='set_budget' and total_budget=<amount> before doing anything else.\n"
+    "action='set_total' before doing anything else.\n"
     "2. Before recommending ANY food, restaurant, or market, check the Conversation Memory "
     "for dietary constraints (e.g. shellfish allergy). If a constraint exists, "
     "explicitly warn about incompatible options and only recommend safe ones.\n"
@@ -167,7 +70,7 @@ def load_model(model_id: str):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
     )
     model.eval()
@@ -228,7 +131,10 @@ _TOOL_ICONS = {
     "budget_tracker": "💰",
 }
 
-_MAX_TOOL_PRINT_CHARS = 4500
+_RESULT_PREVIEW_KEYS = {
+    "weather_fetch":  ["temperature_c", "description", "humidity_pct", "source"],
+    "budget_tracker": ["remaining", "percent_used", "total_spent", "warnings", "status"],
+}
 
 
 def _print_tool_call(name: str, arguments: dict, round_idx: int) -> None:
@@ -244,12 +150,7 @@ def _print_tool_result(name: str, result_json: str, elapsed_ms: int) -> None:
         print(f"{C.DIM}  ↳  raw: {result_json[:200]}{C.RESET}\n")
         return
 
-    meta = obj.get("metadata") or obj.get("search_metadata") or {}
-    source = meta.get("source", "") if isinstance(meta, dict) else ""
-
-    if obj.get("error"):
-        print(f"  {C.RED}{C.BOLD}  ⚠  {obj['error']}{C.RESET}\n")
-        return
+    source = obj.get("source", "")
 
     for w in obj.get("warnings", []):
         print(f"  {C.RED}{C.BOLD}  ⚠  {w}{C.RESET}")
@@ -258,83 +159,26 @@ def _print_tool_result(name: str, result_json: str, elapsed_ms: int) -> None:
         print(f"{C.DIM}  ↳  directive ({elapsed_ms} ms) [{source}]:{C.RESET}")
         for line in obj["guidance"].splitlines():
             print(f"{C.DIM}       {line}{C.RESET}")
-    elif name == "budget_tracker":
-        action = obj.get("action", "")
-        if action == "add_expense":
-            exp = obj.get("expense_added") or {}
-            amt = exp.get("amount_usd", 0)
-            spent = obj.get("running_total_spent_usd", 0)
-            total = obj.get("total_budget_usd", 0)
-            rem = obj.get("remaining_usd", 0)
-            cat = exp.get("category", "")
-            if obj.get("warning"):
-                print(f"  {C.RED}{C.BOLD}  ⚠  {obj['warning']}{C.RESET}")
-            print(f"\n{C.MAGENTA}{C.BOLD}  💰  BUDGET  add_expense  ({cat}){C.RESET}")
-            print(f"{C.MAGENTA}  ┌─────────────────────────────────────────┐{C.RESET}")
-            print(f"{C.MAGENTA}  │  Added      :  ${amt:>10,.2f}                │{C.RESET}")
-            print(f"{C.MAGENTA}  │  Total cap  :  ${total:>10,.2f}                │{C.RESET}")
-            print(f"{C.MAGENTA}  │  Spent      :  ${spent:>10,.2f}                │{C.RESET}")
-            print(f"{C.MAGENTA}  │  Remaining  :  ${rem:>10,.2f}                │{C.RESET}")
-            print(f"{C.MAGENTA}  └─────────────────────────────────────────┘{C.RESET}")
-        elif action == "set_budget":
-            print(f"{C.DIM}  ↳  budget set ({elapsed_ms} ms): "
-                  f"${obj.get('budget_set_usd', 0):,.2f} | "
-                  f"{obj.get('travellers', 1)} travellers | "
-                  f"{obj.get('trip_name', '')}{C.RESET}")
-        elif action == "get_summary":
-            preview = {
-                "trip_name": obj.get("trip_name"),
-                "total_budget_usd": obj.get("total_budget_usd"),
-                "total_spent_usd": obj.get("total_spent_usd"),
-                "remaining_usd": obj.get("remaining_usd"),
-                "budget_health": obj.get("budget_health"),
-            }
-            print(f"{C.DIM}  ↳  summary ({elapsed_ms} ms):{C.RESET}")
-            for line in json.dumps(preview, indent=2).splitlines():
-                print(f"{C.DIM}       {line}{C.RESET}")
-        elif action == "reset":
-            print(f"{C.DIM}  ↳  {obj.get('message', 'reset')}{C.RESET}")
-        else:
-            print(f"{C.DIM}  ↳  data ({elapsed_ms} ms):{C.RESET}")
-            for line in json.dumps(obj, indent=2).splitlines():
-                print(f"{C.DIM}       {line}{C.RESET}")
-    elif name == "weather_fetch":
-        weather = obj.get("weather") or {}
-        preview = {
-            "city": obj.get("city"),
-            "month_data_returned": obj.get("month_data_returned"),
-            "summary": weather.get("summary"),
-        }
-        print(f"{C.DIM}  ↳  weather ({elapsed_ms} ms) [{source}]:{C.RESET}")
-        for line in json.dumps(preview, indent=2).splitlines():
-            print(f"{C.DIM}       {line}{C.RESET}")
-    elif name == "places_search":
-        preview = {
-            "city": obj.get("city"),
-            "category": obj.get("category"),
-            "result_count": obj.get("result_count"),
-        }
-        print(f"{C.DIM}  ↳  places ({elapsed_ms} ms) [{source}]:{C.RESET}")
-        for line in json.dumps(preview, indent=2).splitlines():
-            print(f"{C.DIM}       {line}{C.RESET}")
-    elif name == "web_search":
-        flights = obj.get("flight_results") or []
-        preview = {
-            "search_query": obj.get("search_query"),
-            "results_type": obj.get("results_type"),
-            "flight_count": len(flights),
-            "has_destination_info": bool(obj.get("destination_info")),
-        }
-        print(f"{C.DIM}  ↳  search ({elapsed_ms} ms) [{source}]:{C.RESET}")
-        for line in json.dumps(preview, indent=2).splitlines():
-            print(f"{C.DIM}       {line}{C.RESET}")
+    elif name == "budget_tracker" and obj.get("status") in ("recorded", None):
+        # Show a clear budget box for any add/deduct operation
+        total     = obj.get("budget_total", 0)
+        amount    = obj.get("amount_added", 0)
+        spent     = obj.get("total_spent", 0)
+        remaining = obj.get("remaining", 0)
+        pct       = obj.get("percent_used", 0)
+        category  = obj.get("category", "")
+        print(f"\n{C.MAGENTA}{C.BOLD}  💰  BUDGET UPDATE  ({category}){C.RESET}")
+        print(f"{C.MAGENTA}  ┌─────────────────────────────────────────┐{C.RESET}")
+        print(f"{C.MAGENTA}  │  Expense    : -${amount:>10,.0f}                │{C.RESET}")
+        print(f"{C.MAGENTA}  │  Total      :  ${total:>10,.0f}                │{C.RESET}")
+        print(f"{C.MAGENTA}  │  Spent      :  ${spent:>10,.0f}                │{C.RESET}")
+        print(f"{C.MAGENTA}  │  Remaining  :  ${remaining:>10,.0f}  ({pct}% used)   │{C.RESET}")
+        print(f"{C.MAGENTA}  └─────────────────────────────────────────┘{C.RESET}")
     else:
-        preview = obj
+        preview_keys = _RESULT_PREVIEW_KEYS.get(name)
+        preview      = {k: obj[k] for k in preview_keys if k in obj} if preview_keys else obj
         print(f"{C.DIM}  ↳  data ({elapsed_ms} ms) [{source}]:{C.RESET}")
-        dumped = json.dumps(preview, indent=2)
-        if len(dumped) > _MAX_TOOL_PRINT_CHARS:
-            dumped = dumped[:_MAX_TOOL_PRINT_CHARS] + "\n... [truncated for terminal]"
-        for line in dumped.splitlines():
+        for line in json.dumps(preview, indent=2).splitlines():
             print(f"{C.DIM}       {line}{C.RESET}")
     print()
 
@@ -464,10 +308,10 @@ def agent_turn(tokenizer, model, history: list[dict],
         _print_tool_call(t_name, t_args, round_idx)
 
         t0          = time.monotonic()
-        result_json = execute_tool(t_name, t_args)
+        result_json = execute(t_name, t_args)
         elapsed_ms  = int((time.monotonic() - t0) * 1000)
 
-        if t_name == "budget_tracker" and t_args.get("action") == "add_expense":
+        if t_name == "budget_tracker" and t_args.get("action") in ("add", "deduct"):
             budget_recorded = True
 
         _print_tool_result(t_name, result_json, elapsed_ms)
@@ -524,22 +368,9 @@ def chat_loop(
     system_prompt:  str,
     use_summary:    bool = True,
     debug_summary:  bool = False,
-    summary_interval: int = 1,
-    summary_max_tokens: int = 48,
 ) -> None:
-    if summary_interval < 1:
-        summary_interval = 1
-    summarizer   = (
-        Summarizer(
-            model,
-            tokenizer,
-            debug=debug_summary,
-            max_summary_tokens=summary_max_tokens,
-        )
-        if use_summary
-        else None
-    )
-    tool_block   = build_tool_schema_block()
+    summarizer   = Summarizer(model, tokenizer, debug=debug_summary) if use_summary else None
+    tool_block   = tool_schema_block()
 
     # The "active" system prompt starts bare and gains the summary block each turn
     base_system  = system_prompt
@@ -549,11 +380,7 @@ def chat_loop(
     print(BANNER)
     print(f"{C.DIM}System: {system_prompt}{C.RESET}")
     if use_summary:
-        extra = ""
-        if summary_interval > 1:
-            extra = f" (every {summary_interval} user turns on this device)"
-        print(f"{C.BLUE}CCM Summarizer: ON{extra}{C.RESET}")
-        print(f"{C.DIM}  CCM decode cap: {summary_max_tokens} new tokens (lower = faster){C.RESET}")
+        print(f"{C.BLUE}CCM Summarizer: ON{C.RESET}")
     else:
         print(f"{C.DIM}CCM Summarizer: OFF (--no-summary){C.RESET}")
     print()
@@ -575,7 +402,7 @@ def chat_loop(
         if user_input == "/reset":
             if summarizer:
                 summarizer._current = SummaryBlock()   # fresh empty block
-            execute_tool("budget_tracker", {"action": "reset"})
+            budget_tracker.BUDGET.reset()
             active_system = f"{base_system}\n\n{tool_block}"
             history = [{"role": "system", "content": active_system}]
             print(f"{C.YELLOW}[History, budget, and summary cleared]{C.RESET}\n")
@@ -586,11 +413,7 @@ def chat_loop(
             continue
 
         if user_input == "/budget":
-            status_raw = execute_tool("budget_tracker", {"action": "get_summary"})
-            try:
-                status = json.loads(status_raw)
-            except json.JSONDecodeError:
-                status = {"raw": status_raw}
+            status = budget_tracker.BUDGET.get_status()
             print(f"{C.MAGENTA}{json.dumps(status, indent=2)}{C.RESET}\n")
             continue
 
@@ -627,29 +450,16 @@ def chat_loop(
                 elif any(w in snippet.lower() for w in ["tour", "activity", "ticket"]):
                     category = "activities"
 
-                result_raw = execute_tool(
-                    "budget_tracker",
-                    {
-                        "action": "add_expense",
-                        "amount": amount,
-                        "category": category,
-                        "city": "",
-                        "description": f"auto-detected: {snippet[:60]}",
-                    },
+                before = budget_tracker.BUDGET.total - budget_tracker.BUDGET.spent
+                result = budget_tracker.BUDGET.run(
+                    "add", amount=amount, category=category,
+                    description=f"auto-detected: {snippet[:60]}"
                 )
-                try:
-                    result = json.loads(result_raw)
-                except json.JSONDecodeError:
-                    result = {}
-                summary_raw = execute_tool("budget_tracker", {"action": "get_summary"})
-                try:
-                    status = json.loads(summary_raw)
-                except json.JSONDecodeError:
-                    status = {}
-                total     = status.get("total_budget_usd", 0)
-                spent     = status.get("total_spent_usd", 0)
-                remaining = status.get("remaining_usd", 0)
-                pct       = status.get("spent_percentage") or 0
+                status = budget_tracker.BUDGET.get_status()
+                total     = status["budget_total"]
+                spent     = status["total_spent"]
+                remaining = status["remaining"]
+                pct       = status["percent_used"]
 
                 print(f"\n{C.MAGENTA}{C.BOLD}  💰  BUDGET UPDATE  ({category}){C.RESET}")
                 print(f"{C.MAGENTA}  ┌─────────────────────────────────────────┐{C.RESET}")
@@ -658,37 +468,29 @@ def chat_loop(
                 print(f"{C.MAGENTA}  │  Spent      :  ${spent:>10,.0f}                │{C.RESET}")
                 print(f"{C.MAGENTA}  │  Remaining  :  ${remaining:>10,.0f}  ({pct}% used)   │{C.RESET}")
                 print(f"{C.MAGENTA}  └─────────────────────────────────────────┘{C.RESET}")
-                if result.get("warning"):
-                    print(f"  {C.RED}{C.BOLD}  ⚠  {result['warning']}{C.RESET}")
+                for w in result.get("warnings", []):
+                    print(f"  {C.RED}{C.BOLD}  ⚠  {w}{C.RESET}")
                 print()
 
         history.append({"role": "assistant", "content": response})
 
         # ── CCM: run summary agent, rebuild system prompt ───────────────
         if summarizer:
-            user_turn_idx = sum(1 for m in history if m["role"] == "user")
-            if user_turn_idx % summary_interval != 0:
-                print(
-                    f"{C.DIM}  [CCM] skipped (interval={summary_interval}; "
-                    f"next refresh at user turn "
-                    f"{((user_turn_idx // summary_interval) + 1) * summary_interval}){C.RESET}\n"
-                )
-            else:
-                print(f"{C.DIM}  [CCM] running summarizer…{C.RESET}", flush=True)
-                t0    = time.monotonic()
-                block = summarizer.update(history)
-                ms    = int((time.monotonic() - t0) * 1000)
+            print(f"{C.DIM}  [CCM] running summarizer…{C.RESET}", flush=True)
+            t0    = time.monotonic()
+            block = summarizer.update(history)
+            ms    = int((time.monotonic() - t0) * 1000)
 
-                # Rebuild active system prompt with fresh memory block
-                new_system    = summarizer.inject(base_system, block)
-                active_system = f"{new_system}\n\n{tool_block}"
+            # Rebuild active system prompt with fresh memory block
+            new_system    = summarizer.inject(base_system, block)
+            active_system = f"{new_system}\n\n{tool_block}"
 
-                # Replace the system message in history for the next turn
-                history[0] = {"role": "system", "content": active_system}
+            # Replace the system message in history for the next turn
+            history[0] = {"role": "system", "content": active_system}
 
-                _print_summary_update(block, new_system)
-                print(f"{C.DIM}  [CCM] done in {ms} ms | "
-                      f"context now: {token_count(tokenizer, history)} tokens{C.RESET}\n")
+            _print_summary_update(block, new_system)
+            print(f"{C.DIM}  [CCM] done in {ms} ms | "
+                  f"context now: {token_count(tokenizer, history)} tokens{C.RESET}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -705,18 +507,6 @@ def parse_args():
                    help="Disable the CCM summarizer (baseline mode)")
     p.add_argument("--debug-summary", action="store_true",
                    help="Print raw summarizer model output for debugging")
-    p.add_argument(
-        "--summary-interval",
-        type=int,
-        default=None,
-        help="Run CCM every N user turns (default: 1 on GPU, 2 on CPU). Higher = faster.",
-    )
-    p.add_argument(
-        "--summary-max-tokens",
-        type=int,
-        default=48,
-        help="Max new tokens for CCM summarizer (default 48; lower = faster on CPU).",
-    )
     return p.parse_args()
 
 
@@ -733,16 +523,10 @@ if __name__ == "__main__":
     args          = parse_args()
     system_prompt = resolve_system_prompt(args.system)
     tokenizer, model = load_model(args.model)
-    summary_interval = args.summary_interval
-    if summary_interval is None:
-        summary_interval = 2 if not torch.cuda.is_available() else 1
-    summary_interval = max(1, summary_interval)
     chat_loop(
         tokenizer, model,
         args.max_new_tokens,
         system_prompt,
         use_summary=not args.no_summary,
         debug_summary=args.debug_summary,
-        summary_interval=summary_interval,
-        summary_max_tokens=max(16, args.summary_max_tokens),
     )
