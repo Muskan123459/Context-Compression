@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from .budget_tracker import budget_tracker
 from .places_search import places_search
+from .read_memory import read_memory
 from .registry import TOOL_SCHEMAS, dispatch_tool
 from .weather_fetch import weather_fetch
 from .web_search import web_search
@@ -29,6 +30,7 @@ __all__ = [
     "budget_tracker",
     "dispatch_tool",
     "places_search",
+    "read_memory",
     "weather_fetch",
     "web_search",
 ]

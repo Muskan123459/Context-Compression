@@ -18,8 +18,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import NamedTuple
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
+from config import MEMORY_STORE_DIR, OFFLOAD_PREVIEW_LINES, OFFLOAD_THRESHOLD_TOKENS
+from global_state import count_text_tokens
 from tools import dispatch_tool
 
 
@@ -77,10 +82,114 @@ def _extract_category(message: str) -> str:
 # ---------------------------------------------------------------------------
 # Routing result
 # ---------------------------------------------------------------------------
-class ToolCall(NamedTuple):
-    name:   str
-    args:   dict
-    result: str   # JSON string returned by the tool
+@dataclass
+class ToolCall:
+    """One invocation of a tool, post-offload.
+
+    `result` is what the LLM sees in the chat (either the raw JSON if the tool
+    was small, or the truncation marker + preview + pointer if it was offloaded).
+    `raw_json` is ALWAYS the full raw JSON from the tool — kept so downstream
+    deterministic harvesters (e.g. the state catalog) can parse structured
+    facts even when `result` has been replaced with a truncation marker.
+    `offload_path` is the real file on disk when the result was too large, or
+    `None` when the raw JSON was kept inline.
+    """
+    name:         str
+    args:         dict
+    result:       str
+    raw_json:     str           = ""        # full raw JSON (pre-offload)
+    raw_bytes:    int           = 0         # size of the original JSON result
+    raw_tokens:   int           = 0         # token estimate of the original JSON
+    offload_path: Optional[str] = None      # filename inside MEMORY_STORE_DIR when offloaded
+    preview:      str           = ""        # preview lines shown to the LLM
+
+
+# ---------------------------------------------------------------------------
+# L2 offload helpers
+# ---------------------------------------------------------------------------
+def _ensure_store() -> Path:
+    MEMORY_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    return MEMORY_STORE_DIR
+
+
+def _make_preview(raw_json: str, max_lines: int) -> str:
+    lines = raw_json.splitlines()
+    if len(lines) <= max_lines:
+        return raw_json
+    head = "\n".join(lines[:max_lines])
+    return head + "\n  … (truncated — see file for full content)"
+
+
+def _build_truncation_marker(
+    tool_name: str,
+    args: dict,
+    raw_json: str,
+    raw_tokens: int,
+    relative_path: str,
+) -> tuple[str, str]:
+    """Return (marker_for_chat, preview_text)."""
+    preview = _make_preview(raw_json, OFFLOAD_PREVIEW_LINES)
+    args_str = json.dumps(args, ensure_ascii=False)
+    marker = (
+        f"Tool call: {tool_name}({args_str})\n"
+        f"<TRUNCATED>\n"
+        f"Raw data exceeded inline limits "
+        f"({raw_tokens:,} tokens > {OFFLOAD_THRESHOLD_TOKENS:,}).\n"
+        f"Saved to disk at: {relative_path}\n"
+        f"Preview (first {OFFLOAD_PREVIEW_LINES} lines):\n"
+        f"{preview}\n"
+        f"To read the full file, call the tool: "
+        f'read_memory(path="{relative_path}")'
+    )
+    return marker, preview
+
+
+def _offload_if_large(tool_name: str, args: dict, raw_json: str) -> ToolCall:
+    """Decide inline vs. disk-offload; return a ready-to-render ToolCall."""
+    raw_tokens = count_text_tokens(raw_json)
+    raw_bytes = len(raw_json.encode("utf-8"))
+
+    if raw_tokens <= OFFLOAD_THRESHOLD_TOKENS:
+        return ToolCall(
+            name=tool_name,
+            args=args,
+            result=raw_json,
+            raw_json=raw_json,
+            raw_bytes=raw_bytes,
+            raw_tokens=raw_tokens,
+            offload_path=None,
+            preview="",
+        )
+
+    store = _ensure_store()
+    uid = uuid.uuid4().hex[:8]
+    filename = f"{tool_name}_{uid}.json"
+    filepath = store / filename
+    filepath.write_text(raw_json, encoding="utf-8")
+
+    # Path advertised to the LLM stays relative so the marker text is short
+    # and stable across working directories.
+    relative_path = f"memory_store/{filename}"
+
+    marker, preview = _build_truncation_marker(
+        tool_name, args, raw_json, raw_tokens, relative_path
+    )
+
+    return ToolCall(
+        name=tool_name,
+        args=args,
+        result=marker,
+        raw_json=raw_json,
+        raw_bytes=raw_bytes,
+        raw_tokens=raw_tokens,
+        offload_path=relative_path,
+        preview=preview,
+    )
+
+
+def _dispatch_with_offload(tool_name: str, args: dict) -> ToolCall:
+    raw = dispatch_tool(tool_name, args)
+    return _offload_if_large(tool_name, args, raw)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +202,27 @@ _BOOKING_RE = re.compile(
     r"|please track|track that|add that|add both|add to"
     r"|book that|looks good|that works|looks solid"
     r"|i'?ve booked|i'?ve sorted|i'?ve confirmed"
-    r"|booked at|confirm that|remind me",
+    r"|booked at|confirm that|remind me"
+    # Explicit booking verbs with an object or amount — catches
+    # "book the tokyo hotel", "book a flight for 800 dollars",
+    # "book something for me in flight, 1350 dollars".
+    r"|\bbook\s+(?:a|an|the|my|another|something|anything)\b"
+    r"|\bbook\s+[a-z]{2,}\s+(?:hotel|flight|room|ticket|trip)\b"
+    r"|\bbook\b.{0,60}\$?\s*\d{2,}\s*(?:dollars?|usd|\$)?",
+    re.IGNORECASE,
+)
+
+# Pure-state questions — answered by the pinned state / BUDGET FACTS block,
+# no tool call needed. Running web_search for these was producing 1.8k-token
+# irrelevant results that polluted every subsequent turn.
+_STATE_QUERY_RE = re.compile(
+    r"\b(?:how\s+much|what'?s|what\s+is|whats)\s+"
+    r"(?:my\s+|the\s+)?"
+    r"(?:budget|money|cash|remaining|left|spent|spending)\b"
+    r"|\b(?:budget|money)\s+(?:left|remaining|so\s+far|spent)\b"
+    r"|\bremaining\s+budget\b"
+    r"|\bis\s+(?:it|that|this)\s+(?:over\s*budget|within\s+budget|affordable)\b"
+    r"|\b(?:over|under|within)\s*budget\?*\s*$",
     re.IGNORECASE,
 )
 
@@ -101,6 +230,15 @@ _BOOKING_RE = re.compile(
 def _is_booking_confirmation(message: str) -> bool:
     """True when the user is confirming a price / asking to track spend — not searching."""
     return bool(_BOOKING_RE.search(message))
+
+
+def _is_state_query(message: str) -> bool:
+    """True when the user is only asking about existing budget / spend state.
+
+    These are answered by the pinned state + BUDGET FACTS block the agent
+    already injects — no fresh search is useful or appropriate.
+    """
+    return bool(_STATE_QUERY_RE.search(message))
 
 
 def is_booking_confirmation(message: str) -> bool:
@@ -139,6 +277,11 @@ def route_and_call(user_message: str) -> list[ToolCall]:
     """
     if _is_booking_confirmation(user_message):
         return []
+    if _is_state_query(user_message):
+        # Pure budget/spend question — the pinned state + BUDGET FACTS block
+        # already has the answer. Skip tool calls to avoid polluting the prompt
+        # with an irrelevant 1.8k-token flight search.
+        return []
 
     msg = user_message.lower()
     calls: list[ToolCall] = []
@@ -148,11 +291,14 @@ def route_and_call(user_message: str) -> list[ToolCall]:
     # single primary city.  For web_search queries we want every city mentioned.
     primary_city = cities_in_msg[0] if cities_in_msg else _extract_city(user_message)
 
+    # NOTE: "budget" is deliberately NOT in this keyword list. A user asking
+    # about budget state ("how much budget is left?", "over budget?") is a
+    # state-lookup, not a search intent — _is_state_query handles it above.
     planning_signal = (
         _has_word(msg,
             "flight", "fly", "airline", "route", "ticket",
             "itinerary", "plan", "trip", "suggest", "recommend",
-            "advice", "options", "budget",
+            "advice", "options",
         )
         or "multi-city" in msg
         or "travel from" in msg
@@ -171,8 +317,7 @@ def route_and_call(user_message: str) -> list[ToolCall]:
             query = f"flights delhi to {route_hint}"[:140]
         else:
             query = f"flights {user_message[:120]}"
-        result = dispatch_tool("web_search", {"query": query})
-        calls.append(ToolCall("web_search", {"query": query}, result))
+        calls.append(_dispatch_with_offload("web_search", {"query": query}))
 
     # ── places_search — hotels / restaurants / attractions ────────────────
     city = primary_city
@@ -190,8 +335,7 @@ def route_and_call(user_message: str) -> list[ToolCall]:
             cat = "hotels"
             cities_to_query = cities_in_msg or [city]
             for c in cities_to_query[:3]:
-                result = dispatch_tool("places_search", {"city": c, "category": cat})
-                calls.append(ToolCall("places_search", {"city": c, "category": cat}, result))
+                calls.append(_dispatch_with_offload("places_search", {"city": c, "category": cat}))
 
         # Restaurants / food
         if _has_word(msg,
@@ -199,23 +343,20 @@ def route_and_call(user_message: str) -> list[ToolCall]:
             "dinner", "lunch", "breakfast", "cafe", "dining",
         ) or "things to eat" in msg:
             cat = "restaurants"
-            result = dispatch_tool("places_search", {"city": city, "category": cat})
-            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+            calls.append(_dispatch_with_offload("places_search", {"city": city, "category": cat}))
 
         # Attractions
         if _has_word(msg,
             "attraction", "sightseeing", "temple", "museum", "landmark",
         ) or "things to do" in msg or "observation deck" in msg:
             cat = "attractions"
-            result = dispatch_tool("places_search", {"city": city, "category": cat})
-            calls.append(ToolCall("places_search", {"city": city, "category": cat}, result))
+            calls.append(_dispatch_with_offload("places_search", {"city": city, "category": cat}))
 
         # Weather
         if _has_word(msg,
             "weather", "temperature", "climate", "rain", "forecast",
         ) or "what to wear" in msg or "what to pack" in msg:
-            result = dispatch_tool("weather_fetch", {"city": city})
-            calls.append(ToolCall("weather_fetch", {"city": city}, result))
+            calls.append(_dispatch_with_offload("weather_fetch", {"city": city}))
 
     return calls
 

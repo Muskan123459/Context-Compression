@@ -51,10 +51,10 @@ without any budget caveat — proof the baseline lost the spend state.
 
 Usage
 -----
-  python eval/test_c.py              # live vLLM
-  python eval/test_c.py --dry-run    # offline / CI  (simulates baseline failure)
-  python eval/test_c.py --verbose    # show per-turn response previews
-  python eval/test_c.py --log out/c.json
+  python eval/test_c_short.py              # live vLLM
+  python eval/test_c_short.py --dry-run    # offline / CI  (simulates baseline failure)
+  python eval/test_c_short.py --verbose    # show per-turn response previews
+  python eval/test_c_short.py --log out/c_short.json
 """
 from __future__ import annotations
 
@@ -235,9 +235,9 @@ def run_conversation(
 
     if not dry_run:
         from agent import run_agent  # noqa: PLC0415
-        from global_state import GlobalState  # noqa: PLC0415
+        from global_state import GenericState  # noqa: PLC0415
 
-        conv_state = GlobalState()
+        conv_state = GenericState()
     else:
         conv_state = None  # unused
 

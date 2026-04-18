@@ -330,9 +330,9 @@ def run_conversation(
 
     if not dry_run:
         from agent import run_agent  # noqa: PLC0415
-        from global_state import GlobalState  # noqa: PLC0415
+        from global_state import GenericState  # noqa: PLC0415
 
-        conv_state = GlobalState()
+        conv_state = GenericState()
     else:
         conv_state = None  # unused
 

@@ -9,6 +9,8 @@ from .budget_tracker import SCHEMA as BUDGET_TRACKER_SCHEMA
 from .budget_tracker import budget_tracker
 from .places_search import SCHEMA as PLACES_SEARCH_SCHEMA
 from .places_search import places_search
+from .read_memory import SCHEMA as READ_MEMORY_SCHEMA
+from .read_memory import read_memory
 from .weather_fetch import SCHEMA as WEATHER_FETCH_SCHEMA
 from .weather_fetch import weather_fetch
 from .web_search import SCHEMA as WEB_SEARCH_SCHEMA
@@ -20,6 +22,7 @@ TOOL_SCHEMAS: list[dict] = [
     PLACES_SEARCH_SCHEMA,
     WEATHER_FETCH_SCHEMA,
     BUDGET_TRACKER_SCHEMA,
+    READ_MEMORY_SCHEMA,
 ]
 
 
@@ -34,6 +37,8 @@ def dispatch_tool(name: str, args: dict) -> str:
             result = weather_fetch(**args)
         elif name == "budget_tracker":
             result = budget_tracker(**args)
+        elif name == "read_memory":
+            result = read_memory(**args)
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as exc:

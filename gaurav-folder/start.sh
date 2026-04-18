@@ -9,7 +9,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/.venv-smollm"
-MODEL="HuggingFaceTB/SmolLM3-3B"
+# Upgraded from SmolLM3-3B (too weak for multi-step budget arithmetic and
+# leaked naked tool-call JSON) to Qwen2.5-7B-Instruct-AWQ. Fits an A5000 24GB
+# alongside a 16k KV cache. Override with:  MODEL=… ./start.sh --v1
+MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 VLLM_PORT=8000
 GRADIO_PORT=7860
 
@@ -62,9 +67,9 @@ echo "==> Starting vLLM server on port $VLLM_PORT …"
 VLLM_PID_FILE="/tmp/vllm_v0.pid"
 
 vllm serve "$MODEL" \
-  --max-model-len 8192 \
+  --max-model-len "$MAX_MODEL_LEN" \
+  --gpu-memory-utilization "$GPU_MEM_UTIL" \
   --port "$VLLM_PORT" \
-  --dtype bfloat16 \
   --trust-remote-code \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
