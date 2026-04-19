@@ -81,6 +81,8 @@ class AgentReply:
     pinned_block_tokens:  int             = 0
     compaction:           Optional[CompactionEvent] = None
     read_memory_calls:    list[dict]      = field(default_factory=list)
+    # One snapshot per vLLM request this turn (main call, then read_memory follow-ups).
+    llm_prompt_rounds:    list[list[dict[str, str]]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +232,28 @@ def _coerce_to_text(content: Any) -> str:
                 parts.append(c)
         return "\n".join(parts)
     return ""
+
+
+def _snapshot_messages(messages: list[dict]) -> list[dict[str, str]]:
+    """Copy messages as plain role/content strings for UI / debugging."""
+    snap: list[dict[str, str]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "?")
+        text = _coerce_to_text(m.get("content"))
+        if role == "assistant" and m.get("tool_calls"):
+            try:
+                tc_blob = json.dumps(m["tool_calls"], ensure_ascii=False, indent=2)
+            except Exception:
+                tc_blob = repr(m.get("tool_calls"))
+            text = (text + "\n\n[tool_calls]\n" if text else "[tool_calls]\n") + tc_blob
+        elif role == "tool":
+            name = m.get("name") or ""
+            tid = m.get("tool_call_id") or ""
+            text = f"(tool result · {name} · id={tid})\n{text}"
+        snap.append({"role": role, "content": text})
+    return snap
 
 
 def _distill_one_reply(text: str, client: OpenAI) -> str:
@@ -731,6 +755,8 @@ def run_agent(
     trace.append("── LLM call ──────────────────────")
     _dump_prompt(messages, gs.turn_count, trace)
 
+    llm_prompt_rounds: list[list[dict[str, str]]] = []
+
     # Only expose tools + auto-choice when there's actually an offloaded payload
     # the model might want to fetch back via read_memory. On turns with no
     # <TRUNCATED> marker, passing tools=TOOL_SCHEMAS + tool_choice="auto" causes
@@ -748,6 +774,7 @@ def run_agent(
     )
 
     # ── First LLM call ───────────────────────────────────────────────────
+    llm_prompt_rounds.append(_snapshot_messages(messages))
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
@@ -766,6 +793,7 @@ def run_agent(
     # ── If read_memory was emitted, give the model one more shot ─────────
     if follow_up:
         messages = messages + follow_up
+        llm_prompt_rounds.append(_snapshot_messages(messages))
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -786,6 +814,7 @@ def run_agent(
         )
         if fallback is not None:
             messages = messages + [fallback]
+            llm_prompt_rounds.append(_snapshot_messages(messages))
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -834,6 +863,7 @@ def run_agent(
         pinned_block_tokens=pinned_tokens,
         compaction=compaction_event,
         read_memory_calls=read_memory_calls,
+        llm_prompt_rounds=llm_prompt_rounds,
     )
 
 

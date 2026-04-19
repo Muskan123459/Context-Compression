@@ -6,7 +6,7 @@ Side panels:
   1. Live GenericState JSON (pinned into the system prompt each turn)
   2. Token bar + numbers for the last turn
   3. Tool calls routed (L2 offload path + raw size)
-  4. Offloaded tool dumps on disk (memory_store/)
+  4. Offloaded tool dumps on disk (memory_store/) + model input (exact messages sent to vLLM)
   5. Compaction events across the session
   6. Full agent trace
 """
@@ -31,7 +31,7 @@ from config import (
     VLLM_BASE_URL,
     WARN_THRESHOLD,
 )
-from global_state import GenericState
+from global_state import GenericState, count_text_tokens
 from tool_router import ToolCall
 
 
@@ -47,6 +47,10 @@ class UISession:
     state: GenericState = field(default_factory=_load_persistent_state)
     offloaded: List[dict] = field(default_factory=list)
     compactions: List[CompactionEvent] = field(default_factory=list)
+    # Sum of API-reported usage across successful chat turns (main reply LLM only).
+    cumulative_prompt: int = 0
+    cumulative_completion: int = 0
+    cumulative_total: int = 0
 
 
 def _refresh_state_panel(session: "UISession") -> tuple["UISession", dict]:
@@ -65,13 +69,24 @@ def _clear_memory(session: "UISession") -> tuple["UISession", dict]:
     session.state = GenericState()
     session.offloaded.clear()
     session.compactions.clear()
+    session.cumulative_prompt = 0
+    session.cumulative_completion = 0
+    session.cumulative_total = 0
     return session, session.state.to_dict()
 
 
 # ---------------------------------------------------------------------------
 # Side-panel renderers
 # ---------------------------------------------------------------------------
-def _token_panel_html(prompt: int, completion: int, total: int) -> str:
+def _token_panel_html(
+    prompt: int,
+    completion: int,
+    total: int,
+    *,
+    session_prompt: int = 0,
+    session_completion: int = 0,
+    session_total: int = 0,
+) -> str:
     pct  = (total / CONTEXT_LIMIT * 100) if CONTEXT_LIMIT else 0
     fill = min(pct, 100.0)
 
@@ -84,6 +99,7 @@ def _token_panel_html(prompt: int, completion: int, total: int) -> str:
 
     return f"""
 <div style="font-family: ui-monospace, Menlo, monospace; font-size: 0.82rem;">
+  <div style="color:#64748b; font-size:0.75rem; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.04em;">Last turn</div>
   <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
     <span><b>{total:,}</b> / {CONTEXT_LIMIT:,} tokens
           <span style="color:#64748b;">({pct:.1f}%)</span></span>
@@ -94,6 +110,14 @@ def _token_panel_html(prompt: int, completion: int, total: int) -> str:
   </div>
   <div style="margin-top:6px; color:#475569;">
     prompt: {prompt:,} &nbsp;·&nbsp; completion: {completion:,}
+  </div>
+  <hr style="border:none; border-top:1px solid #e2e8f0; margin:12px 0 0;" />
+  <div style="color:#64748b; font-size:0.75rem; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.04em;">Session total</div>
+  <div style="font-size:1.45rem; font-weight:700; color:#0f172a; line-height:1.2;">
+    {session_total:,} <span style="font-size:0.82rem; font-weight:500; color:#64748b;">tokens</span>
+  </div>
+  <div style="margin-top:8px; color:#475569; font-size:0.78rem;">
+    prompt: {session_prompt:,} &nbsp;·&nbsp; completion: {session_completion:,}
   </div>
 </div>
 """.strip()
@@ -164,6 +188,58 @@ def _compaction_log_text(events: list[CompactionEvent]) -> str:
     return "\n".join(lines)
 
 
+def _format_llm_prompt_rounds(
+    rounds: list[list[dict[str, str]]],
+    *,
+    max_total_chars: int = 200_000,
+    max_msg_chars: int = 32_000,
+) -> str:
+    """Human-readable view of messages sent to vLLM (system + history + user)."""
+    if not rounds:
+        return "_No LLM prompt snapshot for this turn._"
+
+    lines: list[str] = [
+        "What the model receives:\n"
+        "  • Message 1 (role=system): instructions + pinned global state\n"
+        "  • Middle messages: prior conversation (shape depends on HISTORY_MODE: raw, "
+        "distilled one-liners, or a single <history_summary> block)\n"
+        "  • Last message (role=user): budget facts + tool results (if any) + your query\n"
+        "Multiple 'LLM request' blocks below = multiple vLLM calls this turn "
+        "(e.g. after read_memory).\n",
+    ]
+    total_written = 0
+    for ri, snap in enumerate(rounds, start=1):
+        header = f"\n{'═' * 72}\nLLM request {ri} / {len(rounds)}  —  {len(snap)} message(s)\n{'═' * 72}\n"
+        chunk = header
+        if total_written + len(chunk) > max_total_chars:
+            lines.append("\n… [truncated: overall view limit reached]\n")
+            break
+        lines.append(header)
+        total_written += len(header)
+
+        for mi, msg in enumerate(snap):
+            role = msg.get("role", "?")
+            body = msg.get("content") or ""
+            truncated = ""
+            if len(body) > max_msg_chars:
+                body = body[:max_msg_chars] + "\n… [message truncated for UI]"
+                truncated = " (truncated)"
+            tok = count_text_tokens(body)
+            sub = (
+                f"\n── Message {mi + 1} · role={role} · ~{tok:,} tok{truncated} ──\n{body}\n"
+            )
+            if total_written + len(sub) > max_total_chars:
+                lines.append("\n… [truncated: overall view limit reached]\n")
+                total_written = max_total_chars
+                break
+            lines.append(sub)
+            total_written += len(sub)
+        if total_written >= max_total_chars:
+            break
+
+    return "".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Gradio adapter
 # ---------------------------------------------------------------------------
@@ -195,10 +271,18 @@ def chat(
         return (
             err,
             err,
-            _token_panel_html(0, 0, 0),
+            _token_panel_html(
+                0,
+                0,
+                0,
+                session_prompt=session.cumulative_prompt,
+                session_completion=session.cumulative_completion,
+                session_total=session.cumulative_total,
+            ),
             "_Agent crashed._",
             session.state.to_dict(),
             _offloaded_rows(),
+            "_No LLM prompt snapshot._",
             _compaction_log_text(session.compactions),
             session,
         )
@@ -221,12 +305,27 @@ def chat(
 
     session.state.save(PERSISTENT_STATE_PATH)
 
+    session.cumulative_prompt += reply.usage.prompt
+    session.cumulative_completion += reply.usage.completion
+    session.cumulative_total += reply.usage.total
+
     trace_text = "\n".join(reply.trace)
     token_html = _token_panel_html(
-        reply.usage.prompt, reply.usage.completion, reply.usage.total
+        reply.usage.prompt,
+        reply.usage.completion,
+        reply.usage.total,
+        session_prompt=session.cumulative_prompt,
+        session_completion=session.cumulative_completion,
+        session_total=session.cumulative_total,
+    )
+    print(
+        f"  [session] cumulative: {session.cumulative_total:,} tok "
+        f"(prompt sum {session.cumulative_prompt:,}, completion sum {session.cumulative_completion:,})",
+        flush=True,
     )
     tools_md = _tool_calls_panel(reply.tool_calls)
     offload_rows = _offloaded_rows()
+    model_input_text = _format_llm_prompt_rounds(reply.llm_prompt_rounds)
     compaction_md = _compaction_log_text(session.compactions)
 
     return (
@@ -236,6 +335,7 @@ def chat(
         tools_md,
         reply.state.to_dict(),
         offload_rows,
+        model_input_text,
         compaction_md,
         session,
     )
@@ -256,6 +356,7 @@ footer { display: none !important; }
 #trace-box textarea { font-family: ui-monospace, Menlo, monospace; font-size: 0.76rem; }
 #state-box { max-height: 320px; overflow: auto; }
 #offload-box table { font-size: 0.72rem; font-family: ui-monospace, Menlo, monospace; }
+#model-input-box textarea { font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; }
 """
 
 
@@ -282,7 +383,7 @@ def build_ui() -> gr.Blocks:
                     size="sm",
                 )
 
-                gr.Markdown("#### Token usage (last turn)")
+                gr.Markdown("#### Token usage")
                 token_box = gr.HTML(
                     value=_token_panel_html(0, 0, 0),
                     elem_id="token-box",
@@ -294,15 +395,30 @@ def build_ui() -> gr.Blocks:
                     elem_id="tools-box",
                 )
 
-                gr.Markdown("#### Offloaded tool dumps (L2 — `memory_store/`)")
-                offload_box = gr.Dataframe(
-                    headers=["tool", "file", "size", "preview"],
-                    datatype=["str", "str", "str", "str"],
-                    value=_offloaded_rows(),
-                    interactive=False,
-                    wrap=True,
-                    elem_id="offload-box",
-                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### Offloaded tool dumps (L2 — `memory_store/`)")
+                        offload_box = gr.Dataframe(
+                            headers=["tool", "file", "size", "preview"],
+                            datatype=["str", "str", "str", "str"],
+                            value=_offloaded_rows(),
+                            interactive=False,
+                            wrap=True,
+                            elem_id="offload-box",
+                        )
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### Model input (what the LLM sees this turn)")
+                        model_input_box = gr.Textbox(
+                            show_label=False,
+                            lines=16,
+                            max_lines=24,
+                            interactive=False,
+                            elem_id="model-input-box",
+                            placeholder=(
+                                "After you send a message: system prompt + pinned state, "
+                                "conversation memory, and the augmented user message appear here."
+                            ),
+                        )
 
                 gr.Markdown("#### Compaction events (L3 — this session)")
                 compaction_box = gr.Markdown(
@@ -330,6 +446,7 @@ def build_ui() -> gr.Blocks:
                         tools_box,
                         state_box,
                         offload_box,
+                        model_input_box,
                         compaction_box,
                         session,
                     ],
