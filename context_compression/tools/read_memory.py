@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from config import CONVERSATION_STORE_DIR, MEMORY_STORE_DIR
+from ..config import CONVERSATION_STORE_DIR, MEMORY_STORE_DIR
 
 
 def _resolve_safe(path_arg: str) -> Path:

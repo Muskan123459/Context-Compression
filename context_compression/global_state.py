@@ -28,7 +28,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from config import GLOBAL_STATE_TOKEN_CAP
+from .config import GLOBAL_STATE_TOKEN_CAP
 
 
 # ---------------------------------------------------------------------------

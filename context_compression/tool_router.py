@@ -23,9 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from config import MEMORY_STORE_DIR, OFFLOAD_PREVIEW_LINES, OFFLOAD_THRESHOLD_TOKENS
-from global_state import count_text_tokens
-from tools import dispatch_tool
+from .config import MEMORY_STORE_DIR, OFFLOAD_PREVIEW_LINES, OFFLOAD_THRESHOLD_TOKENS
+from .global_state import count_text_tokens
+from .tools import dispatch_tool
 
 
 def _has_word(text: str, *words: str) -> bool:

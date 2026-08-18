@@ -28,8 +28,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from config import MODEL, PIVOT_CONFIRM_MAX_TOKENS, STATE_EXTRACTOR_MAX_TOKENS
-from global_state import ALL_FIELDS, GenericState
+from .config import MODEL, PIVOT_CONFIRM_MAX_TOKENS, STATE_EXTRACTOR_MAX_TOKENS
+from .global_state import ALL_FIELDS, GenericState
 
 if TYPE_CHECKING:
     from openai import OpenAI
