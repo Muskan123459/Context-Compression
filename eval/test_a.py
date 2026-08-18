@@ -155,8 +155,8 @@ def run_conversation(*, dry_run: bool = False, verbose: bool = False) -> RunResu
     result = RunResult()
 
     if not dry_run:
-        from agent import run_agent                      # noqa: PLC0415
-        from global_state import GenericState            # noqa: PLC0415
+        from context_compression.agent import run_agent                      # noqa: PLC0415
+        from context_compression.global_state import GenericState            # noqa: PLC0415
 
         conv_state = GenericState()
     else:

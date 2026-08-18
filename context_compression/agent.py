@@ -33,8 +33,8 @@ from typing import Any, Optional
 
 from openai import OpenAI
 
-from compaction import CompactionEvent, compact, should_compact
-from config import (
+from .compaction import CompactionEvent, compact, should_compact
+from .config import (
     CONTEXT_LIMIT,
     ENABLE_THINKING,
     HISTORY_MODE,
@@ -46,10 +46,10 @@ from config import (
     VLLM_BASE_URL,
     WARN_THRESHOLD,
 )
-from global_state import GenericState, build_budget_facts_block, count_text_tokens
-from state_extractor import run_extractor
-from tool_router import ToolCall, format_context_block, route_and_call
-from tools import TOOL_SCHEMAS, dispatch_tool
+from .global_state import GenericState, build_budget_facts_block, count_text_tokens
+from .state_extractor import run_extractor
+from .tool_router import ToolCall, format_context_block, route_and_call
+from .tools import TOOL_SCHEMAS, dispatch_tool
 
 
 # ---------------------------------------------------------------------------

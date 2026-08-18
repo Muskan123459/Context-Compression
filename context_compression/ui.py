@@ -20,9 +20,9 @@ from typing import List
 
 import gradio as gr
 
-from agent import run_agent
-from compaction import CompactionEvent
-from config import (
+from .agent import run_agent
+from .compaction import CompactionEvent
+from .config import (
     CONTEXT_LIMIT,
     CONVERSATION_STORE_DIR,
     MEMORY_STORE_DIR,
@@ -31,8 +31,8 @@ from config import (
     VLLM_BASE_URL,
     WARN_THRESHOLD,
 )
-from global_state import GenericState, count_text_tokens
-from tool_router import ToolCall
+from .global_state import GenericState, count_text_tokens
+from .tool_router import ToolCall
 
 
 # ---------------------------------------------------------------------------

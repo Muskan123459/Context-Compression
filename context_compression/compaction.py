@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from config import (
+from .config import (
     COMPACT_THRESHOLD_PCT,
     CONTEXT_LIMIT,
     CONVERSATION_STORE_DIR,
@@ -36,7 +36,7 @@ from config import (
     N_COMPACT_TURNS,
     SUMMARY_MAX_TOKENS,
 )
-from global_state import GenericState, count_text_tokens
+from .global_state import GenericState, count_text_tokens
 
 if TYPE_CHECKING:
     from openai import OpenAI
